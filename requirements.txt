@@ -1,0 +1,16 @@
+langchain==1.3.14          # orchestration helpers (messages, prompt types)
+langgraph==1.2.9           # state-machine engine that runs our SQL workflow
+langchain-anthropic==1.4.0 # ChatAnthropic wrapper for Claude models
+
+chainlit==2.11.1           # chat UI
+
+SQLAlchemy==2.0.51         # DB connection engine + query execution
+psycopg2-binary==2.9.12    # PostgreSQL driver used under the hood by SQLAlchemy
+
+python-dotenv==1.2.2       # loads ANTHROPIC_API_KEY / APP_DB_URL from .env
+
+asyncpg==0.31.0             # async PostgreSQL driver used by langgraph
+pandas==2.2.3               # DataFrame support for visualization and analysis
+plotly==5.24.1              # Interactive charts for Chainlit
+kaleido==0.2.1              # PNG export support for Plotly charts
+jsonschema==4.23.0          # Optional validation for the LLM-produced visualization spec

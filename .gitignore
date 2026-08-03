@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Chainlit runtime files
+.chainlit/
+.files/
+chainlit.md
