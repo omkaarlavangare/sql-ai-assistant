@@ -1,43 +1,26 @@
-"""
-app.py - the SQL Insight Assistant.
+"""SQL Insight Assistant app with a LangGraph workflow."""
 
-Flow for every user question (implemented as a LangGraph graph below):
-
-    Understand user question --> write_sql --> execute_sql --(error, < 2 attempts) --> write_sql with error feedback [retry loop]
-                                    |
-                       (success, or out of retries)--> generate_insight --> END
-
-Why LangGraph instead of a simple linear chain?
-A plain "prompt -> SQL -> run -> prompt" pipeline breaks the moment the LLM
-writes SQL with a typo or references a column that doesn't exist - which
-happens often in practice. LangGraph lets us express that as an explicit
-state machine: on failure, loop back to `write_sql` with the error message
-attached, so the LLM can self-correct, instead of just crashing.
-"""
-
-import json                                          # parse the structured visualization spec
-import os                                            # read env vars
-import re                                            # strip markdown fences from LLM SQL output
+import json  # Parse the visualization spec.
+import os  # Read environment variables.
+import re  # Strip markdown fences from model SQL output.
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Any, TypedDict, cast             # type hints for the graph state
+from typing import Any, TypedDict, cast  # Type hints for the graph state.
 
-import chainlit as cl                                  # chat UI
-import pandas as pd                                    # DataFrame support for visualization and analysis
-import plotly.graph_objects as go                     # interactive charts for Chainlit
-from dotenv import load_dotenv                          # loads ANTHROPIC_API_KEY / APP_DB_URL from .env
-from langchain_anthropic import ChatAnthropic            # Claude wrapper
+import chainlit as cl  # Chat UI.
+import pandas as pd  # DataFrame support for analysis and charts.
+import plotly.graph_objects as go  # Interactive charts for Chainlit.
+from dotenv import load_dotenv  # Load values from a local .env file when present.
+from langchain_anthropic import ChatAnthropic  # Claude wrapper.
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.graph import StateGraph, END              # the state-machine builder
+from langgraph.graph import StateGraph, END  # State-machine builder.
 
-from db import get_engine, load_schema, run_sql_dataframe  # our database helpers
+from db import get_engine, load_schema, run_sql_dataframe  # Database helpers.
 
-load_dotenv()  # populate os.environ from a local .env file, if present
+load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Shared objects — created once at import time, reused for every user message
-# ---------------------------------------------------------------------------
-engine = None  # lazily created so helpers can be imported and tested safely
+# Shared objects reused across requests.
+engine = None  # Created lazily so helpers can be imported safely.
 
 
 def get_app_engine():
@@ -48,26 +31,18 @@ def get_app_engine():
     return engine
 
 
-# Initialize the LLM  
+# Initialize the LLM.
 llm = ChatAnthropic(
-    model_name=os.environ.get("CLAUDE_MODEL", "claude-sonnet-5"),  # default to claude-sonnet-5 if not set
-    timeout=60,                                                              # seconds to wait before giving up
-    max_retries=2,                                                           # retry up to 2 times on network errors or timeouts
-    stop=["END_OF_RESPONSE"],                                              # optional stop sequence to prevent the model from generating beyond the expected output
-    streaming=True,                                                        # enables token-by-token output via .astream()
+    model_name=os.environ.get("CLAUDE_MODEL", "claude-sonnet-5"),
+    timeout=60,
+    max_retries=2,
+    stop=["END_OF_RESPONSE"],
+    streaming=True,
 )
 
 
 def _normalize_text_content(content: object) -> str:
-    """
-    Convert Anthropic/LangChain content blocks into plain text.
-
-    Claude may return multiple block types in one response - e.g. a
-    "thinking" block (internal reasoning) followed by a "text" block (the
-    actual answer). We only want the text blocks; thinking blocks must be
-    skipped entirely, otherwise their raw dict/signature payload leaks into
-    whatever we're building (SQL, JSON, the final answer, etc).
-    """
+    """Convert model content blocks into plain text."""
     if isinstance(content, str):
         return content
 
@@ -94,9 +69,7 @@ def _normalize_text_content(content: object) -> str:
 
     return str(content)
 
-# Keywords that indicate the user is asking for a write/destructive operation
-# rather than a read/insight question. Checked against the raw user message
-# (not generated SQL) so we can short-circuit before calling the LLM at all.
+# Reject obvious destructive requests before calling the model.
 _DESTRUCTIVE_KEYWORDS = re.compile(
     r"\b(delete|drop|truncate|remove|destroy|update|insert|alter)\b",
     flags=re.IGNORECASE,
@@ -108,15 +81,9 @@ def _is_destructive_request(text: str) -> bool:
     return bool(_DESTRUCTIVE_KEYWORDS.search(text))
 
 
-# ---------------------------------------------------------------------------
-# Graph state
-# ---------------------------------------------------------------------------
+# Graph state shared across nodes.
 class GraphState(TypedDict):
-    """
-    The data that flows between nodes in the graph. Each node reads what it
-    needs from this dict and returns a partial dict of updates - LangGraph
-    merges those updates into the running state automatically.
-    """
+    """State passed between graph nodes."""
     question: str      # the user's original natural-language question
     chat_history: list[dict[str, str]]  # the conversation history
     schema: str         # cached DB schema text, used as LLM context
@@ -129,11 +96,9 @@ class GraphState(TypedDict):
     final_answer: str          # the natural-language answer shown to the user
 
 
-# ---------------------------------------------------------------------------
-# Graph nodes
-# ---------------------------------------------------------------------------
+# Graph nodes.
 def write_sql(state: GraphState) -> dict:
-    """Ask Claude to turn the question (+ schema, + any past error) into SQL."""
+    """Turn the question and schema into SQL."""
     history_context = ""
     chat_history = state.get("chat_history") or []
     if chat_history:
@@ -149,9 +114,7 @@ def write_sql(state: GraphState) -> dict:
 
     error_context = ""
     if state.get("error"):
-        # Feeding the previous failed query + its error back to the LLM is
-        # what lets it self-correct on the retry instead of repeating the
-        # same mistake.
+        # Reuse the failed query and error to help the retry recover.
         error_context = (
             f"\n\nYour previous attempt failed.\n"
             f"Previous SQL: {state['sql_query']}\n"
@@ -175,19 +138,18 @@ def write_sql(state: GraphState) -> dict:
     )
     content = _normalize_text_content(response.content)
 
-    # Claude sometimes wraps SQL in ```sql ... ``` even when told not to;
-    # this strips that formatting and gets clean SQL.
+    # Strip any markdown fences from the generated SQL.
     sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE).strip()
 
     return {"sql_query": sql, "attempts": state.get("attempts", 0) + 1}
 
 
 def execute_sql(state: GraphState) -> dict:
-    """Run the generated SQL against Postgres; capture success or error."""
+    """Run the generated SQL and capture the result or error."""
     try:
         df, result = run_sql_dataframe(get_app_engine(), state["sql_query"])
         return {"sql_result": result, "dataframe": df, "error": ""}
-    except Exception as exc:                        # any DB error should trigger our retry path
+    except Exception as exc:  # Any database error should trigger the retry path.
         return {"error": str(exc)}
 
 
@@ -265,7 +227,7 @@ def _build_plotly_chart(df: pd.DataFrame, spec: dict[str, Any]):
     x_column = spec.get("x_column", "")
     y_column = spec.get("y_column", "")
 
-    # Truncate long category labels so they don't overflow the axis
+    # Keep long labels readable on the axis.
     x_values = df[x_column]
     if x_values.dtype == object:
         x_values = x_values.astype(str).apply(lambda s: s if len(s) <= 20 else s[:17] + "...")
@@ -316,7 +278,7 @@ def _build_plotly_chart(df: pd.DataFrame, spec: dict[str, Any]):
 
 
 def generate_viz_spec(state: GraphState) -> dict:
-    """Ask the LLM for a structured visualization specification."""
+    """Ask the model for a structured visualization specification."""
     df = state.get("dataframe")
     if df is None:
         return {"viz_spec": {"chart_type": "bar", "x_column": "", "y_column": "", "title": "Result"}}
@@ -342,18 +304,14 @@ def generate_viz_spec(state: GraphState) -> dict:
 
 
 def route_after_execute(state: GraphState) -> str:
-    """
-    Conditional edge: decide whether to retry SQL generation or move on.
-    Capped at 2 attempts total so a persistently-wrong question can't loop
-    forever and rack up LLM calls.
-    """
+    """Decide whether to retry SQL generation or continue."""
     if state.get("error") and state["attempts"] < 2:
         return "retry"
     return "continue"
 
 
 def _build_insight_prompt(state: GraphState) -> str:
-    """Shared prompt builder, used by both the graph node and the streaming call in on_message."""
+    """Build the prompt used to generate the final insight."""
     return (
         "You are a data analyst. Using the SQL query and its result below, "
         "answer the user's original question in clear, plain English. "
@@ -365,16 +323,9 @@ def _build_insight_prompt(state: GraphState) -> str:
 
 
 def generate_insight(state: GraphState) -> dict:
-    """
-    Turn the raw query result into a plain-English answer.
-
-    On success, the actual LLM call is deferred to on_message so the
-    response can be streamed token-by-token into the Chainlit UI. This node
-    only handles the error case (no streaming needed - it's a fixed string).
-    """
+    """Turn the query result into a plain-English answer."""
     if state.get("error"):
-        # We exhausted retries - be transparent about the failure rather
-        # than making something up.
+        # Report the failure directly when retries are exhausted.
         return {
             "final_answer": (
                 "I couldn't run a working SQL query for that question. "
@@ -385,9 +336,7 @@ def generate_insight(state: GraphState) -> dict:
     return {"final_answer": ""}  # signals on_message to stream the real answer
 
 
-# ---------------------------------------------------------------------------
-# Build and compile the graph once at import time
-# ---------------------------------------------------------------------------
+# Build and compile the graph once at import time.
 builder = StateGraph(GraphState)
 builder.add_node("write_sql", write_sql)
 builder.add_node("execute_sql", execute_sql)
@@ -407,9 +356,7 @@ builder.add_edge("generate_insight", END)
 graph = builder.compile()
 
 
-# ---------------------------------------------------------------------------
-# Chainlit UI hooks
-# ---------------------------------------------------------------------------
+# Chainlit UI hooks.
 
 # To use these, remove the await cl.Messages from on_chat_start, as they 
 # @cl.set_starters
@@ -432,7 +379,7 @@ graph = builder.compile()
 
 @cl.on_chat_start
 async def on_chat_start():
-    """Runs once when a user opens the chat: read + cache the DB schema."""
+    """Initialize the session and load the database schema."""
     await cl.Message(content="Connecting to the database and reading its schema...").send()
     schema = load_schema(get_app_engine())  # first call hits the DB; later calls reuse the cache in db.py
     cl.user_session.set("schema", schema)  # stash per-session so on_message can read it back
@@ -443,7 +390,7 @@ async def on_chat_start():
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    """Runs on every user message: execute the LangGraph workflow end-to-end."""
+    """Run the LangGraph workflow for each user message."""
     if _is_destructive_request(message.content):
         await cl.Message(
             content=(
@@ -469,12 +416,10 @@ async def on_message(message: cl.Message):
         "final_answer": "",
     }
 
-    # ainvoke runs the whole graph (including any retry loop) and returns
-    # the final merged state.
+    # Run the graph and return the final merged state.
     final_state = cast(GraphState, await graph.ainvoke(initial_state))
 
-    # Show the SQL that was actually run - transparency matters for a tool
-    # that's making database queries on the user's behalf.
+    # Show the SQL that was actually run.
     await cl.Message(content=f"```sql\n{final_state['sql_query']}\n```").send()
 
     dataframe = final_state.get("dataframe")
@@ -486,10 +431,10 @@ async def on_message(message: cl.Message):
         ).send()
 
     if final_state.get("final_answer"):
-            # Error path: generate_insight already produced the full text, no streaming needed.
+            # Use the final answer directly when the error path is taken.
             await cl.Message(content=final_state["final_answer"]).send()
     else:
-        # Success path: stream the answer token-by-token for better perceived responsiveness.
+        # Stream the answer token-by-token for a smoother experience.
         streamed_msg = cl.Message(content="")
         await streamed_msg.send()
 
@@ -502,7 +447,7 @@ async def on_message(message: cl.Message):
         await streamed_msg.update()
         final_state["final_answer"] = streamed_msg.content
 
-    # Save this turn into conversational memory, capped to the last 5 turns
+    # Save this turn to conversational memory.
     chat_history.append({
         "question": message.content,
         "answer": final_state["final_answer"],
