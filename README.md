@@ -45,6 +45,73 @@ making the assistant useful for both analytics answers and data storytelling.
 - Multi-step LangGraph orchestration that retries failed SQL instead of failing fast
 - Interactive Plotly visualisations for charts, trends, and comparisons
 - Lightweight, extensible MVP architecture designed for rapid experimentation
+- Structured JSONL logging for debugging workflow failures and final run summaries
+
+## Logging and observability
+
+The app now records workflow activity as structured JSONL entries instead of mixing plain-text markers into the file. This keeps logs machine-readable and makes it easier to inspect failures or audit a completed run.
+
+### Log envelope
+
+Every record follows this schema:
+
+```json
+{
+  "record_type": "step" | "run_summary",
+  "run_id": "<uuid>",
+  "timestamp": "<ISO8601 UTC>",
+  "schema_version": "1.0",
+  "status": "success" | "error",
+  "duration_ms": 123,
+  "error": null | "<error message>",
+  "payload": { ... }
+}
+```
+
+### Behavior
+
+- Failed workflow steps log a single `step` record with the step name, timing, and error message.
+- Successful step executions do not emit success logs.
+- Each completed request writes exactly one final `run_summary` record containing the original question, SQL, attempts, structured rows, chart metadata, generated response, and per-step timings.
+- The log file remains valid JSONL: no plain-text separators or `=== RUN START ===` markers are written.
+
+Example final summary record:
+
+```json
+{
+  "record_type": "run_summary",
+  "run_id": "d5c6d7d4-1a9d-4d8d-a81a-6b7efccf0d21",
+  "timestamp": "2026-08-14T12:34:56.789Z",
+  "schema_version": "1.0",
+  "status": "success",
+  "duration_ms": 9854,
+  "error": null,
+  "payload": {
+    "question": "Top 5 products by sales",
+    "sql_query": "SELECT product_name, SUM(total_sales) ...",
+    "attempts": 1,
+    "row_count": 5,
+    "rows": [
+      {"product_name": "Laptop Pro", "total_sales": 86936},
+      {"product_name": "Mobile X", "total_sales": 74132}
+    ],
+    "viz_spec": {
+      "chart_type": "bar",
+      "x_column": "product_name",
+      "y_column": "total_sales",
+      "title": "Sales by Product"
+    },
+    "chart_created": true,
+    "generated_response": "The top products by sales were ...",
+    "step_timings": {
+      "write_sql": 120,
+      "execute_sql": 70,
+      "generate_viz_spec": 45,
+      "generate_insight": 4200
+    }
+  }
+}
+```
 
 ## Project structure
 
