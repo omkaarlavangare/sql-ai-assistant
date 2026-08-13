@@ -1,10 +1,14 @@
 """SQL Insight Assistant app with a LangGraph workflow."""
 
 import json  # Parse the visualization spec.
+import logging  # Log workflow progress and evaluation events.
 import os  # Read environment variables.
 import re  # Strip markdown fences from model SQL output.
-from datetime import date, datetime, time
+import time  # Measure request duration.
+import uuid  # Generate a stable run id for each interaction.
+from datetime import date, datetime, time as dt_time
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, TypedDict, cast  # Type hints for the graph state.
 
 import chainlit as cl  # Chat UI.
@@ -18,6 +22,18 @@ from langgraph.graph import StateGraph, END  # State-machine builder.
 from db import get_engine, load_schema, run_sql_dataframe  # Database helpers.
 
 load_dotenv()
+
+logger = logging.getLogger("sql_insight_assistant")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+LOG_PATH: Path = Path(
+    os.environ.get(
+        "ASSISTANT_LOG_PATH",
+        str(Path(__file__).resolve().parent / "logs" / "assistant_runs.jsonl"),
+    )
+)
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # Shared objects reused across requests.
 engine = None  # Created lazily so helpers can be imported safely.
@@ -81,6 +97,84 @@ def _is_destructive_request(text: str) -> bool:
     return bool(_DESTRUCTIVE_KEYWORDS.search(text))
 
 
+def _utc_timestamp() -> str:
+    """Return an ISO timestamp for logging and persistence."""
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _append_jsonl_record(record: dict[str, Any]) -> None:
+    """Append a structured record to a JSONL log file."""
+    try:
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, default=str, ensure_ascii=False))
+            handle.write("\n")
+    except Exception as exc:
+        logger.exception("Failed to write assistant log record: %s", exc)
+
+
+def _log_error_step(run_id: str, step_name: str, duration_ms: int, error: str) -> None:
+    """Persist a single error log record for a failed workflow step."""
+    record = {
+        "record_type": "step",
+        "run_id": run_id,
+        "timestamp": _utc_timestamp(),
+        "schema_version": "1.0",
+        "step": step_name,
+        "status": "error",
+        "duration_ms": duration_ms,
+        "error": error,
+        "payload": {},
+    }
+    _append_jsonl_record(record)
+    logger.error("workflow_step_failed step=%s run_id=%s error=%s", step_name, run_id, error)
+
+
+def _log_run_summary(state: Any, duration_ms: int, chart_created: bool, insight_duration_ms: int | None = None) -> None:
+    """Persist exactly one structured summary record for the full interaction."""
+    dataframe = state.get("dataframe")
+    row_count = len(dataframe) if dataframe is not None else 0
+    rows = []
+    if dataframe is not None:
+        rows = [_json_safe(row) for row in dataframe.head(50).to_dict(orient="records")]
+
+    step_timings: dict[str, int] = {}
+    for step_result in state.get("step_results", []) or []:
+        if not isinstance(step_result, dict):
+            continue
+        step_name = step_result.get("step")
+        step_duration = step_result.get("duration_ms")
+        if isinstance(step_name, str) and isinstance(step_duration, (int, float)):
+            step_timings[step_name] = int(step_duration)
+
+    if insight_duration_ms is not None:
+        step_timings["generate_insight"] = int(insight_duration_ms)
+
+    error_value = state.get("error") or None
+    status = "error" if bool(error_value) and row_count == 0 else "success"
+    record = {
+        "record_type": "run_summary",
+        "run_id": state.get("run_id"),
+        "timestamp": _utc_timestamp(),
+        "schema_version": "1.0",
+        "status": status,
+        "duration_ms": duration_ms,
+        "error": error_value,
+        "payload": {
+            "question": state.get("question", ""),
+            "sql_query": state.get("sql_query", ""),
+            "attempts": state.get("attempts", 0),
+            "row_count": row_count,
+            "rows": rows,
+            "viz_spec": state.get("viz_spec", {}),
+            "chart_created": chart_created,
+            "generated_response": state.get("final_answer", ""),
+            "step_timings": step_timings,
+        },
+    }
+    _append_jsonl_record(record)
+    logger.info("persisted_run_summary run_id=%s status=%s", record["run_id"], record["status"])
+
+
 # Graph state shared across nodes.
 class GraphState(TypedDict):
     """State passed between graph nodes."""
@@ -94,62 +188,82 @@ class GraphState(TypedDict):
     error: str              # last execution error, or "" if none
     attempts: int             # how many times we've tried to write working SQL
     final_answer: str          # the natural-language answer shown to the user
+    run_id: str              # unique id for logging and evaluation
+    started_at: str          # timestamp when the request started
+    step_results: list[dict[str, Any]]  # workflow steps captured for audit/evaluation
+    row_count: int           # number of rows returned from the executed query
+    chart_created: bool      # whether a Plotly chart was rendered
 
 
 # Graph nodes.
 def write_sql(state: GraphState) -> dict:
     """Turn the question and schema into SQL."""
-    history_context = ""
-    chat_history = state.get("chat_history") or []
-    if chat_history:
-        turns = "\n".join(
-            f"Q: {turn['question']}\nA: {turn['answer']}" for turn in chat_history
+    start_time = time.perf_counter()
+    try:
+        history_context = ""
+        chat_history = state.get("chat_history") or []
+        if chat_history:
+            turns = "\n".join(
+                f"Q: {turn['question']}\nA: {turn['answer']}" for turn in chat_history
+            )
+            history_context = (
+                "\n\nHere is the recent conversation for context. The user's new "
+                "question may refer back to it (e.g. 'now filter by...', 'summarize "
+                "the last messages'):\n"
+                f"{turns}"
+            )
+
+        error_context = ""
+        if state.get("error"):
+            # Reuse the failed query and error to help the retry recover.
+            error_context = (
+                f"\n\nYour previous attempt failed.\n"
+                f"Previous SQL: {state['sql_query']}\n"
+                f"Error: {state['error']}\n"
+                f"Please write a corrected query."
+            )
+
+        system_prompt = (
+            "You are a PostgreSQL expert. Using ONLY the tables/columns in the "
+            "schema below, write ONE valid PostgreSQL SELECT query that answers "
+            "the user's question. Use the schema-qualified table names exactly as "
+            "shown. Reply with the raw SQL only - no markdown code fences, no "
+            "explanation.\n\n"
+            f"Database schema:\n{state['schema']}"
+            f"{history_context}"
+            f"{error_context}"
         )
-        history_context = (
-            "\n\nHere is the recent conversation for context. The user's new "
-            "question may refer back to it (e.g. 'now filter by...', 'summarize "
-            "the last messages'):\n"
-            f"{turns}"
+
+        response = llm.invoke(
+            [SystemMessage(content=system_prompt), HumanMessage(content=state["question"])]
         )
+        content = _normalize_text_content(response.content)
 
-    error_context = ""
-    if state.get("error"):
-        # Reuse the failed query and error to help the retry recover.
-        error_context = (
-            f"\n\nYour previous attempt failed.\n"
-            f"Previous SQL: {state['sql_query']}\n"
-            f"Error: {state['error']}\n"
-            f"Please write a corrected query."
-        )
-
-    system_prompt = (
-        "You are a PostgreSQL expert. Using ONLY the tables/columns in the "
-        "schema below, write ONE valid PostgreSQL SELECT query that answers "
-        "the user's question. Use the schema-qualified table names exactly as "
-        "shown. Reply with the raw SQL only - no markdown code fences, no "
-        "explanation.\n\n"
-        f"Database schema:\n{state['schema']}"
-        f"{history_context}"
-        f"{error_context}"
-    )
-
-    response = llm.invoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=state["question"])]
-    )
-    content = _normalize_text_content(response.content)
-
-    # Strip any markdown fences from the generated SQL.
-    sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE).strip()
-
-    return {"sql_query": sql, "attempts": state.get("attempts", 0) + 1}
+        # Strip any markdown fences from the generated SQL.
+        sql = re.sub(r"^```(?:sql)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE).strip()
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        state.setdefault("step_results", []).append({"step": "write_sql", "duration_ms": duration_ms})
+        return {"sql_query": sql, "attempts": state.get("attempts", 0) + 1}
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        state.setdefault("step_results", []).append({"step": "write_sql", "duration_ms": duration_ms})
+        _log_error_step(state["run_id"], "write_sql", duration_ms, str(exc))
+        raise
 
 
 def execute_sql(state: GraphState) -> dict:
     """Run the generated SQL and capture the result or error."""
+    start_time = time.perf_counter()
     try:
         df, result = run_sql_dataframe(get_app_engine(), state["sql_query"])
-        return {"sql_result": result, "dataframe": df, "error": ""}
+        row_count = len(df)
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        state.setdefault("step_results", []).append({"step": "execute_sql", "duration_ms": duration_ms})
+        return {"sql_result": result, "dataframe": df, "error": "", "row_count": row_count}
     except Exception as exc:  # Any database error should trigger the retry path.
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        state.setdefault("step_results", []).append({"step": "execute_sql", "duration_ms": duration_ms})
+        _log_error_step(state["run_id"], "execute_sql", duration_ms, str(exc))
         return {"error": str(exc)}
 
 
@@ -161,7 +275,7 @@ def _json_safe(value: Any) -> Any:
             return int(value)
         return float(value)
 
-    if isinstance(value, (datetime, date, time)):
+    if isinstance(value, (datetime, date, dt_time)):
         return value.isoformat()
 
     if isinstance(value, dict):
@@ -279,28 +393,37 @@ def _build_plotly_chart(df: pd.DataFrame, spec: dict[str, Any]):
 
 def generate_viz_spec(state: GraphState) -> dict:
     """Ask the model for a structured visualization specification."""
-    df = state.get("dataframe")
-    if df is None:
-        return {"viz_spec": {"chart_type": "bar", "x_column": "", "y_column": "", "title": "Result"}}
-
-    prompt = (
-        "You are a helpful data assistant. Given the dataframe description below, "
-        "choose the best simple chart for the results. Return ONLY valid JSON with this structure:\n"
-        "{\n  \"chart_type\": \"bar|line|scatter\",\n  \"x_column\": \"column_name\",\n  \"y_column\": \"column_name\",\n  \"title\": \"short plain English title\"\n}\n"
-        "Rules:\n- Use only columns present in the dataframe.\n- Keep the title short and easy to understand.\n- Prefer bar charts for comparisons.\n- Prefer line charts for trends over time.\n- Prefer scatter charts for relationships.\n\n"
-        f"Dataframe description:\n{_describe_dataframe(df)}"
-    )
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    content = _normalize_text_content(response.content)
-
+    start_time = time.perf_counter()
     try:
-        raw_spec = json.loads(content)
-    except Exception:
-        raw_spec = {}
+        df = state.get("dataframe")
+        if df is None:
+            return {"viz_spec": {"chart_type": "bar", "x_column": "", "y_column": "", "title": "Result"}}
 
-    validated = _validate_viz_spec(raw_spec, list(df.columns))
-    return {"viz_spec": validated}
+        prompt = (
+            "You are a helpful data assistant. Given the dataframe description below, "
+            "choose the best simple chart for the results. Return ONLY valid JSON with this structure:\n"
+            "{\n  \"chart_type\": \"bar|line|scatter\",\n  \"x_column\": \"column_name\",\n  \"y_column\": \"column_name\",\n  \"title\": \"short plain English title\"\n}\n"
+            "Rules:\n- Use only columns present in the dataframe.\n- Keep the title short and easy to understand.\n- Prefer bar charts for comparisons.\n- Prefer line charts for trends over time.\n- Prefer scatter charts for relationships.\n\n"
+            f"Dataframe description:\n{_describe_dataframe(df)}"
+        )
+
+        response = llm.invoke([HumanMessage(content=prompt)])
+        content = _normalize_text_content(response.content)
+
+        try:
+            raw_spec = json.loads(content)
+        except Exception:
+            raw_spec = {}
+
+        validated = _validate_viz_spec(raw_spec, list(df.columns))
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        state.setdefault("step_results", []).append({"step": "generate_viz_spec", "duration_ms": duration_ms})
+        return {"viz_spec": validated}
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        state.setdefault("step_results", []).append({"step": "generate_viz_spec", "duration_ms": duration_ms})
+        _log_error_step(state["run_id"], "generate_viz_spec", duration_ms, str(exc))
+        raise
 
 
 def route_after_execute(state: GraphState) -> str:
@@ -324,8 +447,11 @@ def _build_insight_prompt(state: GraphState) -> str:
 
 def generate_insight(state: GraphState) -> dict:
     """Turn the query result into a plain-English answer."""
+    start_time = time.perf_counter()
     if state.get("error"):
-        # Report the failure directly when retries are exhausted.
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        state.setdefault("step_results", []).append({"step": "generate_insight", "duration_ms": duration_ms})
+        _log_error_step(state["run_id"], "generate_insight", duration_ms, state.get("error", ""))
         return {
             "final_answer": (
                 "I couldn't run a working SQL query for that question. "
@@ -333,6 +459,8 @@ def generate_insight(state: GraphState) -> dict:
             )
         }
 
+    duration_ms = int((time.perf_counter() - start_time) * 1000)
+    state.setdefault("step_results", []).append({"step": "generate_insight", "duration_ms": duration_ms})
     return {"final_answer": ""}  # signals on_message to stream the real answer
 
 
@@ -398,11 +526,12 @@ async def on_message(message: cl.Message):
                 "insert data. I can only answer questions using SELECT queries."
             )
         ).send()
-        return    
+        return
     schema = cl.user_session.get("schema", "")
     schema_text = str(schema or "")
     chat_history = cl.user_session.get("chat_history") or []
 
+    started_at = _utc_timestamp()
     initial_state: GraphState = {
         "question": message.content,
         "chat_history": chat_history,
@@ -414,7 +543,14 @@ async def on_message(message: cl.Message):
         "error": "",
         "attempts": 0,
         "final_answer": "",
+        "run_id": str(uuid.uuid4()),
+        "started_at": started_at,
+        "step_results": [],
+        "row_count": 0,
+        "chart_created": False,
     }
+
+    start_time = time.perf_counter()
 
     # Run the graph and return the final merged state.
     final_state = cast(GraphState, await graph.ainvoke(initial_state))
@@ -423,29 +559,49 @@ async def on_message(message: cl.Message):
     await cl.Message(content=f"```sql\n{final_state['sql_query']}\n```").send()
 
     dataframe = final_state.get("dataframe")
+    chart_created = False
     if dataframe is not None:
         fig = _build_plotly_chart(dataframe, final_state.get("viz_spec", {}))
         await cl.Message(
             content="Here is the generated chart:",
             elements=[cl.Plotly(name="chart", figure=fig, display="inline")],
         ).send()
+        chart_created = True
 
+    insight_duration_ms: int | None = None
     if final_state.get("final_answer"):
-            # Use the final answer directly when the error path is taken.
-            await cl.Message(content=final_state["final_answer"]).send()
+        # Use the final answer directly when the error path is taken.
+        await cl.Message(content=final_state["final_answer"]).send()
     else:
         # Stream the answer token-by-token for a smoother experience.
         streamed_msg = cl.Message(content="")
         await streamed_msg.send()
 
-        insight_prompt = _build_insight_prompt(final_state)
-        async for chunk in llm.astream([HumanMessage(content=insight_prompt)]):
-            token = _normalize_text_content(chunk.content)
-            if token:
-                await streamed_msg.stream_token(token)
+        insight_start = time.perf_counter()
+        try:
+            insight_prompt = _build_insight_prompt(final_state)
+            async for chunk in llm.astream([HumanMessage(content=insight_prompt)]):
+                token = _normalize_text_content(chunk.content)
+                if token:
+                    await streamed_msg.stream_token(token)
 
-        await streamed_msg.update()
-        final_state["final_answer"] = streamed_msg.content
+            await streamed_msg.update()
+            final_state["final_answer"] = streamed_msg.content
+            insight_duration_ms = int((time.perf_counter() - insight_start) * 1000)
+        except Exception as exc:
+            insight_duration_ms = int((time.perf_counter() - insight_start) * 1000)
+            final_state.setdefault("step_results", []).append({"step": "generate_insight", "duration_ms": insight_duration_ms})
+            _log_error_step(final_state["run_id"], "generate_insight_stream", insight_duration_ms, str(exc))
+            fallback_answer = f"I ran the query but couldn't generate the summary text: {exc}"
+            final_state["final_answer"] = fallback_answer
+            streamed_msg.content = fallback_answer
+            await streamed_msg.update()
+
+    final_state["chart_created"] = chart_created
+    final_state["row_count"] = len(dataframe) if dataframe is not None else 0
+    final_state["step_results"] = final_state.get("step_results", [])
+    duration_ms = int((time.perf_counter() - start_time) * 1000)
+    _log_run_summary(final_state, duration_ms, chart_created, insight_duration_ms)
 
     # Save this turn to conversational memory.
     chat_history.append({
