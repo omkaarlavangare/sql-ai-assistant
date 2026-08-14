@@ -308,6 +308,31 @@ def _describe_dataframe(df: pd.DataFrame) -> str:
     )
 
 
+def _format_schema_for_display(schema: str) -> str:
+    """Convert the compact schema text into a readable markdown-friendly list."""
+    if not schema or not schema.strip():
+        return "No schema information available."
+
+    lines: list[str] = []
+    for item in schema.splitlines():
+        item = item.strip()
+        if not item:
+            continue
+
+        if "(" in item and item.endswith(")"):
+            table_name, columns_part = item[:-1].split("(", 1)
+            columns = [col.strip() for col in columns_part.split(",") if col.strip()]
+            lines.append(f"**{table_name}**")
+            for column in columns:
+                lines.append(f"- {column}")
+            lines.append("")
+        else:
+            lines.append(f"**{item}**")
+            lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 def _validate_viz_spec(spec: Any, columns: list[str]) -> dict[str, Any]:
     """Validate and normalize the chart spec returned by the LLM."""
     if not isinstance(spec, dict):
@@ -511,9 +536,14 @@ async def on_chat_start():
     await cl.Message(content="Connecting to the database and reading its schema...").send()
     schema = load_schema(get_app_engine())  # first call hits the DB; later calls reuse the cache in db.py
     cl.user_session.set("schema", schema)  # stash per-session so on_message can read it back
-    cl.user_session.set("chat_history", []) # conversational memory, reset per session
+    cl.user_session.set("chat_history", [])  # conversational memory, reset per session
+
     await cl.Message(
-        content="Ready! Ask me an insight question, e.g. **\"Top 5 products by sales\"**."
+        content=(
+            "### Database schema\n\n"
+            f"{_format_schema_for_display(schema)}\n\n"
+            "Ready! Ask me an insight question, e.g. **\"Top 5 products by sales\"**."
+        )
     ).send()
 
 @cl.on_message
